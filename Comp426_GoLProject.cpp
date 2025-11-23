@@ -25,19 +25,20 @@ std::uniform_int_distribution<int> speciesCountDistribution(5, 10);
 const int NUM_SPECIES = (uint8_t)speciesCountDistribution(seedGen);
 
 // Colors for species (RGB each 0-255) - index 0 reserved for dead
-const uint8_t SPECIES_COLORS[11][3] = {
-    {0, 0, 0},        // dead
-    {255, 0, 0},      // species1
-    {0, 255, 0},      // species2
-    {0, 0, 255},      // species3
-    {255, 255, 0},    // species4
-    {255, 0, 255},    // species5
-    {0, 255, 255},    // species6
-    {255, 165, 0},    // species7
-    {128, 0, 128},    // species8
-    {192, 192, 192},  // species9
-    {255, 255, 255}   // species10
+static const std::vector<uint32_t> COLORS = {
+    0xFF000000u, // dead
+    0xFFA500FFu,
+    0xFF800080u,
+    0xFF32CD32u,
+    0xFFFF00FFu,
+    0xFF9000FFu,
+    0xFF228B22u,
+    0xFF89CFF0u,
+    0xFFF5F5DCu,
+    0xFF00FFFFu,
+    0xFFFF4500u
 };
+
 
 int idx(int x, int y) { return y * GRID_W + x; }
 
@@ -147,15 +148,16 @@ __kernel void gol_render_kernel(
     
     uchar species = grid_in[index];
     
-    const uchar palette[11][3] = {
-        {0,0,0}, {255,0,0}, {0,255,0}, {0,0,255}, {255,255,0},
-        {255,0,255}, {0,255,255}, {255,165,0}, {128,0,128}, {192,192,192}, {255,255,255}
+    const uint palette[11] = {
+        0xFF000000u, 0xFFA500FFu, 0xFF800080u, 0xFF32CD32u, 0xFFFF00FFu,
+        0xFF9000FFu, 0xFF228B22u, 0xFF89CFF0u, 0xFFF5F5DCu, 0xFF00FFFFu, 0xFFFF4500u
     };
     
+    uint color = palette[species];
     int p = index * 3;
-    rgb_out[p+0] = palette[species][0];
-    rgb_out[p+1] = palette[species][1];
-    rgb_out[p+2] = palette[species][2];
+    rgb_out[p+0] = (color >> 16) & 0xFF;  // R
+    rgb_out[p+1] = (color >> 8) & 0xFF;   // G
+    rgb_out[p+2] = color & 0xFF;          // B
 }
 )CLC";
 
@@ -256,9 +258,10 @@ int main() {
         for (int x = 0; x < GRID_W; ++x) {
             grid_cur[idx(x, y)] = (uint8_t)d(rng);
             uint8_t s = grid_cur[idx(x, y)];
-            pixels_cpu[idx(x, y) * 3 + 0] = SPECIES_COLORS[s][0];
-            pixels_cpu[idx(x, y) * 3 + 1] = SPECIES_COLORS[s][1];
-            pixels_cpu[idx(x, y) * 3 + 2] = SPECIES_COLORS[s][2];
+            uint32_t color = COLORS[s];
+            pixels_cpu[idx(x, y) * 3 + 0] = (color >> 16) & 0xFF; // R
+            pixels_cpu[idx(x, y) * 3 + 1] = (color >> 8) & 0xFF;  // G
+            pixels_cpu[idx(x, y) * 3 + 2] = color & 0xFF;         // B
         }
     }
 
@@ -469,9 +472,10 @@ int main() {
             // Fallback: render on CPU if no OpenCL CPU device
             for (int i = 0; i < GRID_W * GRID_H; ++i) {
                 uint8_t s = grid_cur[i];
-                pixels_cpu[i * 3 + 0] = SPECIES_COLORS[s][0];
-                pixels_cpu[i * 3 + 1] = SPECIES_COLORS[s][1];
-                pixels_cpu[i * 3 + 2] = SPECIES_COLORS[s][2];
+                uint32_t color = COLORS[s];
+                pixels_cpu[i * 3 + 0] = (color >> 16) & 0xFF; // R
+                pixels_cpu[i * 3 + 1] = (color >> 8) & 0xFF;  // G
+                pixels_cpu[i * 3 + 2] = color & 0xFF;         // B
             }
         }
 
