@@ -17,7 +17,7 @@ static constexpr int WIN_W = 1024;
 static constexpr int WIN_H = 768;
 static constexpr int GRID_W = WIN_W;
 static constexpr int GRID_H = WIN_H;
-static constexpr bool OUTPUT_DEVICE_INFO = false;
+static constexpr bool OUTPUT_DEVICE_INFO = true;
 
 // Random number of species (5..10)
 std::mt19937 seedGen((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
@@ -66,22 +66,19 @@ void main(){
 }
 )";
 
-// OpenCL kernel source
-const char* cl_kernel_src = R"CLC(
-__constant sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
-
+// OpenCL GPU kernel - computes next game state
+const char* cl_gpu_kernel_src = R"CLC(
 inline uint lcg_rand_uint(uint state) {
     state = (1103515245u * state + 12345u);
     return state;
 }
 
-__kernel void gol_kernel(
+__kernel void gol_compute_kernel(
     const int width,
     const int height,
     const int num_species,
     const uint frame_seed,
     __global const uchar* grid_in,
-    __global uchar* rgb_out,
     __global uchar* grid_out
 ){
     int gx = get_global_id(0);
@@ -131,18 +128,34 @@ __kernel void gol_kernel(
         final_species = candidates[pick];
     }
 
-    // write grid_out
     grid_out[index] = final_species;
+}
+)CLC";
 
-    // write rgb_out
+// OpenCL CPU kernel - renders grid to RGB
+const char* cl_cpu_kernel_src = R"CLC(
+__kernel void gol_render_kernel(
+    const int width,
+    const int height,
+    __global const uchar* grid_in,
+    __global uchar* rgb_out
+){
+    int gx = get_global_id(0);
+    int gy = get_global_id(1);
+    if (gx >= width || gy >= height) return;
+    int index = gy * width + gx;
+    
+    uchar species = grid_in[index];
+    
     const uchar palette[11][3] = {
         {0,0,0}, {255,0,0}, {0,255,0}, {0,0,255}, {255,255,0},
         {255,0,255}, {0,255,255}, {255,165,0}, {128,0,128}, {192,192,192}, {255,255,255}
     };
-    int p = index*3;
-    rgb_out[p+0] = palette[final_species][0];
-    rgb_out[p+1] = palette[final_species][1];
-    rgb_out[p+2] = palette[final_species][2];
+    
+    int p = index * 3;
+    rgb_out[p+0] = palette[species][0];
+    rgb_out[p+1] = palette[species][1];
+    rgb_out[p+2] = palette[species][2];
 }
 )CLC";
 
@@ -176,7 +189,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "GOL OpenCL Windows Iris Xe", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(WIN_W, WIN_H, "GOL OpenCL GPU+CPU Pipeline", NULL, NULL);
     if (!window) {
         std::cerr << "Window creation failed\n";
         glfwTerminate();
@@ -234,7 +247,6 @@ int main() {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    // allocate RGBA8
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, GRID_W, GRID_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
     // Initialize grid randomly
@@ -257,29 +269,50 @@ int main() {
     clerr = clGetPlatformIDs(1, &platform, &num_plat);
     check_cl(clerr, "clGetPlatformIDs");
 
-    cl_device_id device = nullptr;
-    cl_uint num_dev = 0;
-    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, &num_dev);
+    // Get GPU device
+    cl_device_id gpu_device = nullptr;
+    cl_uint num_gpu = 0;
+    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &gpu_device, &num_gpu);
+    if (clerr != CL_SUCCESS) {
+        clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &gpu_device, &num_gpu);
+        check_cl(clerr, "clGetDeviceIDs fallback");
+    }
+
+    // Get CPU device
+    cl_device_id cpu_device = nullptr;
+    cl_uint num_cpu = 0;
+    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &cpu_device, &num_cpu);
+    if (clerr != CL_SUCCESS) {
+        std::cerr << "Warning: No CPU device found, will use GPU for rendering too\n";
+        cpu_device = nullptr;
+    }
 
     // Output device info
     if (OUTPUT_DEVICE_INFO) {
         char name[256];
-        clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, NULL);
+        std::cout << "\n=== GPU Device (Compute) ===\n";
+        clGetDeviceInfo(gpu_device, CL_DEVICE_NAME, sizeof(name), name, NULL);
         std::cout << "Device Name: " << name << "\n";
         cl_uint vendorId;
-        clGetDeviceInfo(device, CL_DEVICE_VENDOR_ID, sizeof(vendorId), &vendorId, NULL);
+        clGetDeviceInfo(gpu_device, CL_DEVICE_VENDOR_ID, sizeof(vendorId), &vendorId, NULL);
         std::cout << "Vendor ID: " << vendorId << "\n";
         char vendor[256];
-        clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+        clGetDeviceInfo(gpu_device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
         std::cout << "Vendor: " << vendor << "\n";
+
+        if (cpu_device) {
+            std::cout << "\n=== CPU Device (Render) ===\n";
+            clGetDeviceInfo(cpu_device, CL_DEVICE_NAME, sizeof(name), name, NULL);
+            std::cout << "Device Name: " << name << "\n";
+            clGetDeviceInfo(cpu_device, CL_DEVICE_VENDOR_ID, sizeof(vendorId), &vendorId, NULL);
+            std::cout << "Vendor ID: " << vendorId << "\n";
+            clGetDeviceInfo(cpu_device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+            std::cout << "Vendor: " << vendor << "\n";
+        }
+        std::cout << "\nPipeline: GPU computes next state, CPU renders to RGB\n\n";
     }
 
-    if (clerr != CL_SUCCESS) {
-        clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, &num_dev);
-        check_cl(clerr, "clGetDeviceIDs fallback");
-    }
-
-    // Prepare context properties for WGL sharing
+    // Create context for GPU
     cl_context_properties props[] = {
         CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
         CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
@@ -287,61 +320,92 @@ int main() {
         0
     };
 
-    cl_context clContext = clCreateContext(props, 1, &device, NULL, NULL, &clerr);
+    cl_context gpu_context = clCreateContext(props, 1, &gpu_device, NULL, NULL, &clerr);
     if (clerr != CL_SUCCESS) {
-        // fallback: create normal context
-        clContext = clCreateContext(NULL, 1, &device, NULL, NULL, &clerr);
-        check_cl(clerr, "clCreateContext fallback");
+        gpu_context = clCreateContext(NULL, 1, &gpu_device, NULL, NULL, &clerr);
+        check_cl(clerr, "clCreateContext GPU fallback");
     }
 
-    //cl_command_queue_properties properties[] =
-    //{
-    //    CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
-    //    CL_WGL_HDC_KHR, (cl_context_properties)wglGetCurrentDC(),
-    //    CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
-    //};
+    cl_command_queue gpu_queue = clCreateCommandQueue(gpu_context, gpu_device, 0, &clerr);
+    check_cl(clerr, "clCreateCommandQueue GPU");
 
+    // Create context for CPU
+    cl_context cpu_context = nullptr;
+    cl_command_queue cpu_queue = nullptr;
+    if (cpu_device) {
+        cpu_context = clCreateContext(NULL, 1, &cpu_device, NULL, NULL, &clerr);
+        check_cl(clerr, "clCreateContext CPU");
 
-    cl_command_queue clQueue = clCreateCommandQueue(
-        clContext,
-        device,
-        CL_QUEUE_PROFILING_ENABLE,
-        &clerr
-    );
+        cpu_queue = clCreateCommandQueue(cpu_context, cpu_device, 0, &clerr);
+        check_cl(clerr, "clCreateCommandQueue CPU");
+    }
 
-    check_cl(clerr, "clCreateCommandQueue");
-
-    // Build program
-    const char* src_ptr = cl_kernel_src;
-    cl_program program = clCreateProgramWithSource(clContext, 1, &src_ptr, nullptr, &clerr);
-    check_cl(clerr, "clCreateProgramWithSource");
-    clerr = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    // Build GPU program (compute)
+    const char* gpu_src_ptr = cl_gpu_kernel_src;
+    cl_program gpu_program = clCreateProgramWithSource(gpu_context, 1, &gpu_src_ptr, nullptr, &clerr);
+    check_cl(clerr, "clCreateProgramWithSource GPU");
+    clerr = clBuildProgram(gpu_program, 1, &gpu_device, NULL, NULL, NULL);
     if (clerr != CL_SUCCESS) {
         size_t logsz = 0;
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
+        clGetProgramBuildInfo(gpu_program, gpu_device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
         std::vector<char> log(logsz + 1);
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
-        std::cerr << "Build log:\n" << log.data() << "\n";
-        check_cl(clerr, "clBuildProgram");
+        clGetProgramBuildInfo(gpu_program, gpu_device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
+        std::cerr << "GPU Build log:\n" << log.data() << "\n";
+        check_cl(clerr, "clBuildProgram GPU");
     }
 
-    cl_kernel kernel = clCreateKernel(program, "gol_kernel", &clerr);
-    check_cl(clerr, "clCreateKernel");
+    cl_kernel gpu_kernel = clCreateKernel(gpu_program, "gol_compute_kernel", &clerr);
+    check_cl(clerr, "clCreateKernel GPU");
 
-    // Create buffers
-    cl_mem d_grid_in = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * grid_cur.size(), grid_cur.data(), &clerr);
-    check_cl(clerr, "clCreateBuffer grid_in");
+    // Build CPU program (render)
+    cl_program cpu_program = nullptr;
+    cl_kernel cpu_kernel = nullptr;
+    if (cpu_device) {
+        const char* cpu_src_ptr = cl_cpu_kernel_src;
+        cpu_program = clCreateProgramWithSource(cpu_context, 1, &cpu_src_ptr, nullptr, &clerr);
+        check_cl(clerr, "clCreateProgramWithSource CPU");
+        clerr = clBuildProgram(cpu_program, 1, &cpu_device, NULL, NULL, NULL);
+        if (clerr != CL_SUCCESS) {
+            size_t logsz = 0;
+            clGetProgramBuildInfo(cpu_program, cpu_device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
+            std::vector<char> log(logsz + 1);
+            clGetProgramBuildInfo(cpu_program, cpu_device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
+            std::cerr << "CPU Build log:\n" << log.data() << "\n";
+            check_cl(clerr, "clBuildProgram CPU");
+        }
 
-    cl_mem d_grid_out = clCreateBuffer(clContext, CL_MEM_READ_WRITE, sizeof(uint8_t) * grid_cur.size(), nullptr, &clerr);
-    check_cl(clerr, "clCreateBuffer grid_out");
+        cpu_kernel = clCreateKernel(cpu_program, "gol_render_kernel", &clerr);
+        check_cl(clerr, "clCreateKernel CPU");
+    }
 
-    cl_mem d_rgb_out = clCreateBuffer(clContext, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * GRID_W * GRID_H * 3, nullptr, &clerr);
-    check_cl(clerr, "clCreateBuffer rgb_out");
+    // Create buffers for GPU (compute)
+    cl_mem gpu_grid_in = clCreateBuffer(gpu_context, CL_MEM_READ_ONLY, sizeof(uint8_t) * grid_cur.size(), nullptr, &clerr);
+    check_cl(clerr, "clCreateBuffer GPU grid_in");
 
-    // Set kernel constant args (width, height, species)
-    check_cl(clSetKernelArg(kernel, 0, sizeof(int), &GRID_W), "clSetKernelArg 0");
-    check_cl(clSetKernelArg(kernel, 1, sizeof(int), &GRID_H), "clSetKernelArg 1");
-    check_cl(clSetKernelArg(kernel, 2, sizeof(int), &NUM_SPECIES), "clSetKernelArg 2");
+    cl_mem gpu_grid_out = clCreateBuffer(gpu_context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * grid_cur.size(), nullptr, &clerr);
+    check_cl(clerr, "clCreateBuffer GPU grid_out");
+
+    // Create buffers for CPU (render)
+    cl_mem cpu_grid_in = nullptr;
+    cl_mem cpu_rgb_out = nullptr;
+    if (cpu_device) {
+        cpu_grid_in = clCreateBuffer(cpu_context, CL_MEM_READ_ONLY, sizeof(uint8_t) * grid_cur.size(), nullptr, &clerr);
+        check_cl(clerr, "clCreateBuffer CPU grid_in");
+
+        cpu_rgb_out = clCreateBuffer(cpu_context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * GRID_W * GRID_H * 3, nullptr, &clerr);
+        check_cl(clerr, "clCreateBuffer CPU rgb_out");
+    }
+
+    // Set kernel constant args for GPU
+    check_cl(clSetKernelArg(gpu_kernel, 0, sizeof(int), &GRID_W), "clSetKernelArg GPU 0");
+    check_cl(clSetKernelArg(gpu_kernel, 1, sizeof(int), &GRID_H), "clSetKernelArg GPU 1");
+    check_cl(clSetKernelArg(gpu_kernel, 2, sizeof(int), &NUM_SPECIES), "clSetKernelArg GPU 2");
+
+    // Set kernel constant args for CPU
+    if (cpu_device) {
+        check_cl(clSetKernelArg(cpu_kernel, 0, sizeof(int), &GRID_W), "clSetKernelArg CPU 0");
+        check_cl(clSetKernelArg(cpu_kernel, 1, sizeof(int), &GRID_H), "clSetKernelArg CPU 1");
+    }
 
     // GL shader uniform
     glUseProgram(prog);
@@ -352,37 +416,70 @@ int main() {
     while (!glfwWindowShouldClose(window)) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // Write current grid to device
-        check_cl(clEnqueueWriteBuffer(clQueue, d_grid_in, CL_TRUE, 0,
+        // Upload current grid to both GPU and CPU
+        check_cl(clEnqueueWriteBuffer(gpu_queue, gpu_grid_in, CL_FALSE, 0,
             sizeof(uint8_t) * grid_cur.size(), grid_cur.data(), 0, NULL, NULL),
-            "clEnqueueWriteBuffer grid_in");
+            "clEnqueueWriteBuffer GPU grid_in");
 
-        // Set per-frame args: frame seed, grid_in/out, rgb_out
+        if (cpu_device) {
+            check_cl(clEnqueueWriteBuffer(cpu_queue, cpu_grid_in, CL_FALSE, 0,
+                sizeof(uint8_t) * grid_cur.size(), grid_cur.data(), 0, NULL, NULL),
+                "clEnqueueWriteBuffer CPU grid_in");
+        }
+
+        // GPU: Compute next state
         uint32_t frame_seed = frame * 1640531527u + 123456789u;
-        check_cl(clSetKernelArg(kernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg 3");
-        check_cl(clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_grid_in), "clSetKernelArg 4");
-        check_cl(clSetKernelArg(kernel, 5, sizeof(cl_mem), &d_rgb_out), "clSetKernelArg 5");
-        check_cl(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_grid_out), "clSetKernelArg 6");
+        check_cl(clSetKernelArg(gpu_kernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg GPU 3");
+        check_cl(clSetKernelArg(gpu_kernel, 4, sizeof(cl_mem), &gpu_grid_in), "clSetKernelArg GPU 4");
+        check_cl(clSetKernelArg(gpu_kernel, 5, sizeof(cl_mem), &gpu_grid_out), "clSetKernelArg GPU 5");
 
         size_t gws[2] = { (size_t)GRID_W, (size_t)GRID_H };
-        size_t lws[2] = { 16, 16 }; // tuneable for Intel Iris Xe
-        check_cl(clEnqueueNDRangeKernel(clQueue, kernel, 2, NULL, gws, lws, 0, NULL, NULL), "clEnqueueNDRangeKernel");
+        size_t gpu_lws[2] = { 16, 16 };
+        check_cl(clEnqueueNDRangeKernel(gpu_queue, gpu_kernel, 2, NULL, gws, gpu_lws, 0, NULL, NULL),
+            "clEnqueueNDRangeKernel GPU");
 
-        clFinish(clQueue);
+        // CPU: Render current state to RGB (runs in parallel with GPU compute)
+        if (cpu_device) {
+            check_cl(clSetKernelArg(cpu_kernel, 2, sizeof(cl_mem), &cpu_grid_in), "clSetKernelArg CPU 2");
+            check_cl(clSetKernelArg(cpu_kernel, 3, sizeof(cl_mem), &cpu_rgb_out), "clSetKernelArg CPU 3");
 
-        // Read back rgb_out to host
-        check_cl(clEnqueueReadBuffer(clQueue, d_rgb_out, CL_TRUE, 0,
-            sizeof(uint8_t) * GRID_W * GRID_H * 3, pixels_cpu.data(), 0, NULL, NULL), "clEnqueueReadBuffer rgb_out");
+            size_t cpu_lws[2] = { 8, 8 };
+            check_cl(clEnqueueNDRangeKernel(cpu_queue, cpu_kernel, 2, NULL, gws, cpu_lws, 0, NULL, NULL),
+                "clEnqueueNDRangeKernel CPU");
+        }
 
-        // Upload to GL texture (RGBA8 but we only filled RGB bytes; we'll set A=255 via GL)
+        // Wait for both to finish
+        clFinish(gpu_queue);
+        if (cpu_device) {
+            clFinish(cpu_queue);
+        }
+
+        // Read back results
+        std::vector<uint8_t> next_grid(GRID_W * GRID_H);
+        check_cl(clEnqueueReadBuffer(gpu_queue, gpu_grid_out, CL_TRUE, 0,
+            sizeof(uint8_t) * next_grid.size(), next_grid.data(), 0, NULL, NULL),
+            "clEnqueueReadBuffer GPU grid_out");
+
+        if (cpu_device) {
+            check_cl(clEnqueueReadBuffer(cpu_queue, cpu_rgb_out, CL_TRUE, 0,
+                sizeof(uint8_t) * GRID_W * GRID_H * 3, pixels_cpu.data(), 0, NULL, NULL),
+                "clEnqueueReadBuffer CPU rgb_out");
+        }
+        else {
+            // Fallback: render on CPU if no OpenCL CPU device
+            for (int i = 0; i < GRID_W * GRID_H; ++i) {
+                uint8_t s = grid_cur[i];
+                pixels_cpu[i * 3 + 0] = SPECIES_COLORS[s][0];
+                pixels_cpu[i * 3 + 1] = SPECIES_COLORS[s][1];
+                pixels_cpu[i * 3 + 2] = SPECIES_COLORS[s][2];
+            }
+        }
+
+        // Upload to GL texture
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RGB, GL_UNSIGNED_BYTE, pixels_cpu.data());
 
-        // Swap grid buffers on host: copy grid_out -> grid_cur
-        std::vector<uint8_t> next_grid(GRID_W * GRID_H);
-        check_cl(clEnqueueReadBuffer(clQueue, d_grid_out, CL_TRUE, 0,
-            sizeof(uint8_t) * next_grid.size(), next_grid.data(), 0, NULL, NULL),
-            "clEnqueueReadBuffer grid_out");
+        // Swap grid buffers
         grid_cur.swap(next_grid);
 
         // Render
@@ -401,7 +498,6 @@ int main() {
         ++frame;
         auto t1 = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = t1 - t0;
-        // Limit to 30 FPS
         if (elapsed.count() < (1000.0 / 30.0)) {
             Sleep((DWORD)((1000.0 / 31.0) - elapsed.count()));
             t1 = std::chrono::high_resolution_clock::now();
@@ -409,19 +505,31 @@ int main() {
         }
         double fps = 1000.0 / (elapsed.count() + 1e-6);
         if ((frame & 31) == 0) {
-            std::cout << "frame " << frame << " fps ~ " << fps << " num_species=" << NUM_SPECIES << "\n";
+            std::cout << "frame " << frame << " fps ~ " << fps
+                << " num_species=" << NUM_SPECIES
+                << " (GPU:compute, CPU:render)\n";
         }
     }
 
-    // Clean up
-    clReleaseMemObject(d_grid_in);
-    clReleaseMemObject(d_grid_out);
-    clReleaseMemObject(d_rgb_out);
-    clReleaseKernel(kernel);
-    clReleaseProgram(program);
-    clReleaseCommandQueue(clQueue);
-    clReleaseContext(clContext);
+    // Clean up GPU resources
+    clReleaseMemObject(gpu_grid_in);
+    clReleaseMemObject(gpu_grid_out);
+    clReleaseKernel(gpu_kernel);
+    clReleaseProgram(gpu_program);
+    clReleaseCommandQueue(gpu_queue);
+    clReleaseContext(gpu_context);
 
+    // Clean up CPU resources
+    if (cpu_device) {
+        clReleaseMemObject(cpu_grid_in);
+        clReleaseMemObject(cpu_rgb_out);
+        clReleaseKernel(cpu_kernel);
+        clReleaseProgram(cpu_program);
+        clReleaseCommandQueue(cpu_queue);
+        clReleaseContext(cpu_context);
+    }
+
+    // Clean up GL resources
     glDeleteTextures(1, &tex);
     glDeleteProgram(prog);
     glDeleteBuffers(1, &vbo);
