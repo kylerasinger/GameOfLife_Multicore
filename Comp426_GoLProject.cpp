@@ -108,7 +108,7 @@ __kernel void gol_logic_compute_kernel(
         }
         else if (count > 1) {
             // Multiple species can birth: random selection
-            uint state = (uint)(x * 73856093u ^ y * 19349663u ^ frame_seed);
+            uint state = (uint)(x * y * frame_seed); // More random tie breaker
             state = lcg_rand_uint(state);
             int selected = state % count;
             grid_out[idx] = (uchar)(candidates[selected] + 1);
@@ -243,7 +243,7 @@ int main() {
     cl_context context = clCreateContext(properties, 1, &gpuDevice, NULL, NULL, &clerr);
     checkClHelper(clerr, "clCreateContext");
 
-    cl_command_queue queue = clCreateCommandQueue(context, gpuDevice, 0, &clerr);
+    cl_command_queue gpuCommandQueue = clCreateCommandQueue(context, gpuDevice, 0, &clerr);
     checkClHelper(clerr, "clCreateCommandQueue");
 
     // Build compute program
@@ -302,40 +302,46 @@ int main() {
         ++frame;
 
         // Upload current grid to GPU
-        checkClHelper(clEnqueueWriteBuffer(queue, clCurrentGrid, CL_FALSE, 0,
-            sizeof(uint8_t) * world.currentGrid.size(), world.currentGrid.data(), 0, NULL, NULL),
-            "clEnqueueWriteBuffer grid_in");
+        checkClHelper(clEnqueueWriteBuffer(gpuCommandQueue, clCurrentGrid, CL_FALSE, 0,
+                                           sizeof(uint8_t) * world.currentGrid.size(), 
+                                           world.currentGrid.data(), 0, NULL, NULL),
+                      "clEnqueueWriteBuffer");
 
         // GPU: Compute next state
-        uint32_t frame_seed = frame * 1640531527u + 123456789u;
-        checkClHelper(clSetKernelArg(gpuKernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg compute 3");
+        uint32_t frameSeed = frame * SPECIES_COUNT; // This makes it random based on the frame count and species count
+        checkClHelper(clSetKernelArg(gpuKernel, 3, sizeof(uint32_t), &frameSeed), "clSetKernelArg compute 3");
         checkClHelper(clSetKernelArg(gpuKernel, 4, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg compute 4");
         checkClHelper(clSetKernelArg(gpuKernel, 5, sizeof(cl_mem), &clNextGrid), "clSetKernelArg compute 5");
 
-        size_t gws[2] = { (size_t)world.w, (size_t)world.h };
-        size_t lws[2] = { 16, 16 };
-        checkClHelper(clEnqueueNDRangeKernel(queue, gpuKernel, 2, NULL, gws, lws, 0, NULL, NULL),
-            "clEnqueueNDRangeKernel compute");
+        // Same thread count and work-groups as the CUDA implementation. 
+        size_t threadCount[2] = { (size_t)world.w, (size_t)world.h };
+        size_t groupSize[2] = { 16, 16 };
+        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, gpuKernel, 2, NULL, threadCount, 
+                                             groupSize, 0, NULL, NULL),
+                      "clEnqueueNDRangeKernel");
 
         // GPU: Render current grid to RGBA buffer
         checkClHelper(clSetKernelArg(cpuKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
         checkClHelper(clSetKernelArg(cpuKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
 
-        checkClHelper(clEnqueueNDRangeKernel(queue, cpuKernel, 2, NULL, gws, lws, 0, NULL, NULL),
-            "clEnqueueNDRangeKernel render");
+        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, cpuKernel, 2, NULL, 
+                                             threadCount, groupSize, 0, NULL, NULL),
+                      "clEnqueueNDRangeKernel");
 
         // Wait for OpenCL to finish
-        clFinish(queue);
+        clFinish(gpuCommandQueue);
 
         // Read back pixel data from GPU
-        checkClHelper(clEnqueueReadBuffer(queue, clRgbaBuffer, CL_TRUE, 0,
-            sizeof(uint8_t) * pixelData.size(), pixelData.data(), 0, NULL, NULL),
-            "clEnqueueReadBuffer rgba_buffer");
+        checkClHelper(clEnqueueReadBuffer(gpuCommandQueue, clRgbaBuffer, CL_TRUE, 0,
+                                          sizeof(uint8_t) * pixelData.size(), pixelData.data(), 
+                                          0, NULL, NULL),
+                      "clEnqueueReadBuffer rgba_buffer");
 
         // Read back next grid state
-        checkClHelper(clEnqueueReadBuffer(queue, clNextGrid, CL_TRUE, 0,
-            sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(), 0, NULL, NULL),
-            "clEnqueueReadBuffer grid_out");
+        checkClHelper(clEnqueueReadBuffer(gpuCommandQueue, clNextGrid, CL_TRUE, 0,
+                                          sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(), 
+                                          0, NULL, NULL),
+                      "clEnqueueReadBuffer grid_out");
 
         // Update texture with pixel data
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -381,7 +387,7 @@ int main() {
     clReleaseKernel(cpuKernel);
     clReleaseProgram(gpuProgram);
     clReleaseProgram(cpuProgram);
-    clReleaseCommandQueue(queue);
+    clReleaseCommandQueue(gpuCommandQueue);
     clReleaseContext(context);
 
     // Clean up GL resources
