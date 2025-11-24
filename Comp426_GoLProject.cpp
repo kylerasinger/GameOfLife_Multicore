@@ -14,11 +14,10 @@
 
 static constexpr int W = 1024;
 static constexpr int H = 768;
-static constexpr int TARGET_FPS = 10;
+static constexpr int TARGET_FPS = 500;
 static constexpr bool TRACK_FPS = true;
 static constexpr bool OUTPUT_DEVICE_INFO = true;
 
-// Random number of species (5..10)
 std::mt19937 seedGen((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
 std::uniform_int_distribution<int> speciesCountDistribution(5, 10);
 const int SPECIES_COUNT = (uint8_t)speciesCountDistribution(seedGen);
@@ -46,8 +45,8 @@ struct World {
     std::vector<uint8_t> nextGrid;
     int w, h, species;
 };
-
-// OpenCL GPU kernel - computes next game state
+ 
+// Computes frame N+1
 const char* clComputeKernelSourceString = R"CLC(
 inline uint lcg_rand_uint(uint state) {
     state = (1103515245u * state + 12345u);
@@ -57,9 +56,9 @@ inline uint lcg_rand_uint(uint state) {
 __kernel void gol_logic_compute_kernel(
     const int width,
     const int height,
-    const int num_species,
-    const uint frame_seed,
-    __global const uchar* grid_in,
+    const int numSpecies,
+    const uint frameSeed,
+    __global const uchar* gridIn,
     __global uchar* grid_out
 ){
     int x = get_global_id(0);
@@ -68,7 +67,7 @@ __kernel void gol_logic_compute_kernel(
     if (x >= width || y >= height) return;
     
     const int idx = y * width + x;
-    const uchar currentCell = grid_in[idx];
+    const uchar currentCell = gridIn[idx];
     
     // Direction offsets for 8 neighbors
     const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
@@ -77,63 +76,62 @@ __kernel void gol_logic_compute_kernel(
     int neighborCount[10] = { 0 };
     
     for (int n = 0; n < 8; ++n) {
-        int nx = (x + dx[n] + width) % width;
+        int nx = (x + dx[n] + width) % width; // wraps
         int ny = (y + dy[n] + height) % height;
-        uchar neighbor = grid_in[ny * width + nx];
+        uchar neighbor = gridIn[ny * width + nx];
         if (neighbor) {
             neighborCount[neighbor - 1]++;
         }
     }
     
     if (currentCell) {
-        // Alive: survive if 2 or 3 neighbors of same species
+        // Alive condition, if 2 or 3 same species neighbors
         int speciesIndex = currentCell - 1;
         int sameSpecies = neighborCount[speciesIndex];
         grid_out[idx] = (sameSpecies == 2 || sameSpecies == 3) ? currentCell : 0;
     }
     else {
-        // Dead: birth if exactly 3 neighbors of one species
         int candidates[10];
         int count = 0;
-        for (int s = 0; s < num_species; ++s) {
+        for (int s = 0; s < numSpecies; ++s) {
             if (neighborCount[s] == 3) {
                 candidates[count++] = s;
             }
         }
         
         if (count == 1) {
-            // Simple birth from single species
+            // Simple birth
             grid_out[idx] = (uchar)(candidates[0] + 1);
         }
         else if (count > 1) {
-            // Multiple species can birth: random selection
-            uint state = (uint)(x * y * frame_seed); // More random tie breaker
+            // Random birth (>1)
+            uint state = (uint)(x * y * frameSeed); // More random tie breaker
             state = lcg_rand_uint(state);
             int selected = state % count;
             grid_out[idx] = (uchar)(candidates[selected] + 1);
         }
         else {
-            // No birth
+            // Dead condition
             grid_out[idx] = 0;
         }
     }
 }
 )CLC";
 
-// OpenCL render kernel - renders grid to RGBA
+// Renders frame N.
 const char* clRenderKernelSourceString = R"CLC(
 __kernel void gol_render_kernel(
     const int width,
     const int height,
-    __global const uchar* grid_in,
-    __global uchar* rgba_out
+    __global const uchar* gridIn,
+    __global uchar* rgbaPbo
 ){
     int gx = get_global_id(0);
     int gy = get_global_id(1);
     if (gx >= width || gy >= height) return;
     int index = gy * width + gx;
     
-    uchar species = grid_in[index];
+    uchar species = gridIn[index];
     
     const uint palette[11] = {
         0xFF000000u, 0xFFA500FFu, 0xFF800080u, 0xFF32CD32u, 0xFFFF00FFu,
@@ -142,10 +140,10 @@ __kernel void gol_render_kernel(
     
     uint color = palette[species];
     int p = index * 4;
-    rgba_out[p+0] = (color >> 16) & 0xFF;  // R
-    rgba_out[p+1] = (color >> 8) & 0xFF;   // G
-    rgba_out[p+2] = color & 0xFF;          // B
-    rgba_out[p+3] = 0xFF;                  // A
+    rgbaPbo[p+0] = (color >> 16) & 0xFF;  // R
+    rgbaPbo[p+1] = (color >> 8) & 0xFF;   // G
+    rgbaPbo[p+2] = color & 0xFF;          // B
+    rgbaPbo[p+3] = 0xFF;                  // A
 }
 )CLC";
 
@@ -165,6 +163,15 @@ int main() {
     world.species = SPECIES_COUNT;
     world.currentGrid.resize(W * H);
     world.nextGrid.resize(W * H);
+
+    // Initialize grid randomly
+    std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+    std::uniform_int_distribution<int> d(0, world.species);
+    for (int y = 0; y < world.h; ++y) {
+        for (int x = 0; x < world.w; ++x) {
+            world.currentGrid[index(x, y)] = (uint8_t)d(rng);
+        }
+    }
 
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -191,37 +198,15 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-
-    // Create OpenGL Pixel Buffer Object (PBO) for shared memory
-    GLuint pbo;
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, W * H * 4 * sizeof(uint8_t), nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // Initialize grid randomly
-    std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-    std::uniform_int_distribution<int> d(0, world.species);
-    for (int y = 0; y < world.h; ++y) {
-        for (int x = 0; x < world.w; ++x) {
-            world.currentGrid[index(x, y)] = (uint8_t)d(rng);
-        }
-    }
-
+    
     // Set up OpenCL
     cl_int clerr;
     cl_platform_id platform = nullptr;
     cl_uint num_plat = 0;
-    checkClHelper(clGetPlatformIDs(1, &platform, &num_plat), "clGetPlatformIDs");
-
-    // Get GPU device
     cl_device_id gpuDevice = nullptr;
     cl_uint num_gpu = 0;
-    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &gpuDevice, &num_gpu);
-    if (clerr != CL_SUCCESS) {
-        checkClHelper(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &gpuDevice, &num_gpu),
-                      "clGetDeviceIDs fallback");
-    }
+    checkClHelper(clGetPlatformIDs(1, &platform, &num_plat), "clGetPlatformIDs");
+    checkClHelper(clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &gpuDevice, &num_gpu), "clGetDeviceIDs");
 
     // Check for cl_khr_gl_sharing extension support
     size_t extensionsSize;
@@ -229,11 +214,17 @@ int main() {
     std::vector<char> extensions(extensionsSize);
     clGetDeviceInfo(gpuDevice, CL_DEVICE_EXTENSIONS, extensionsSize, extensions.data(), nullptr);
     std::string extensionsStr(extensions.data());
-
     if (extensionsStr.find("cl_khr_gl_sharing") == std::string::npos) {
         std::cerr << "Error: cl_khr_gl_sharing extension not supported!\n";
         return 4;
     }
+
+    // Create OpenGL Pixel Buffer Object (PBO) for shared memory
+    GLuint pbo;
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, W * H * 4 * sizeof(uint8_t), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     // Output device info
     if (OUTPUT_DEVICE_INFO) {
@@ -269,7 +260,6 @@ int main() {
     cl_program computeProgram = clCreateProgramWithSource(context, 1, &computeKernelSource, nullptr, &clerr);
     checkClHelper(clerr, "clCreateProgramWithSource");
     checkClHelper(clBuildProgram(computeProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
-
     cl_kernel computeKernel = clCreateKernel(computeProgram, "gol_logic_compute_kernel", &clerr);
     checkClHelper(clerr, "clCreateKernel");
 
@@ -278,7 +268,6 @@ int main() {
     cl_program renderProgram = clCreateProgramWithSource(context, 1, &renderKernelSource, nullptr, &clerr);
     checkClHelper(clerr, "clCreateProgramWithSource");
     checkClHelper(clBuildProgram(renderProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
-
     cl_kernel renderKernel = clCreateKernel(renderProgram, "gol_render_kernel", &clerr);
     checkClHelper(clerr, "clCreateKernel");
 
@@ -288,16 +277,13 @@ int main() {
     cl_mem clNextGrid = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * world.nextGrid.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer");
 
-    // Create OpenCL buffer from OpenGL PBO (shared memory!)
-    cl_mem clRgbaBuffer = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pbo, &clerr);
+    // Create OpenCL buffer from OpenGL PBO
+    cl_mem clRgbaBufferPBO = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pbo, &clerr);
     checkClHelper(clerr, "clCreateFromGLBuffer");
 
-    // Set kernel constant args for GPU compute
     checkClHelper(clSetKernelArg(computeKernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
     checkClHelper(clSetKernelArg(computeKernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
     checkClHelper(clSetKernelArg(computeKernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
-
-    // Set kernel constant args for CPU render
     checkClHelper(clSetKernelArg(renderKernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
     checkClHelper(clSetKernelArg(renderKernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
 
@@ -306,8 +292,11 @@ int main() {
     int frame = 0;
     int frames = 0;
 
-    // Main loop
+    // mr loop
     while (!glfwWindowShouldClose(win)) {
+        // Compute kernel computes frame N+1.
+        // Render kernel renders frame N.
+
         auto now = std::chrono::steady_clock::now();
         if (now < nextTick)
         {
@@ -324,7 +313,7 @@ int main() {
                                            world.currentGrid.data(), 0, NULL, NULL),
                       "clEnqueueWriteBuffer");
 
-        // GPU: Compute next state
+        // Compute next state
         uint32_t frameSeed = frame * SPECIES_COUNT; // This makes it random based on the frame count and species count
         checkClHelper(clSetKernelArg(computeKernel, 3, sizeof(uint32_t), &frameSeed), "clSetKernelArg compute 3");
         checkClHelper(clSetKernelArg(computeKernel, 4, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg compute 4");
@@ -336,24 +325,22 @@ int main() {
         checkClHelper(clEnqueueNDRangeKernel(commandQueue, computeKernel, 2, NULL, threadCount, 
                                              groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
-
-        // Flush OpenGL queue before acquiring shared objects
         glFlush();
 
         // Acquire shared GL object for OpenCL use
-        checkClHelper(clEnqueueAcquireGLObjects(commandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+        checkClHelper(clEnqueueAcquireGLObjects(commandQueue, 1, &clRgbaBufferPBO, 0, NULL, NULL),
                       "clEnqueueAcquireGLObjects");
 
-        // GPU: Render current grid to shared RGBA buffer
+        // Render current grid to shared PBO
         checkClHelper(clSetKernelArg(renderKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
-        checkClHelper(clSetKernelArg(renderKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
+        checkClHelper(clSetKernelArg(renderKernel, 3, sizeof(cl_mem), &clRgbaBufferPBO), "clSetKernelArg render 3");
 
         checkClHelper(clEnqueueNDRangeKernel(commandQueue, renderKernel, 2, NULL,
                                              threadCount, groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
 
         // Release shared GL object back to OpenGL
-        checkClHelper(clEnqueueReleaseGLObjects(commandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+        checkClHelper(clEnqueueReleaseGLObjects(commandQueue, 1, &clRgbaBufferPBO, 0, NULL, NULL),
                       "clEnqueueReleaseGLObjects");
 
         // Wait for OpenCL to finish
@@ -374,7 +361,6 @@ int main() {
         // Swap grid buffers
         world.currentGrid.swap(world.nextGrid);
 
-        // Render with fixed-function pipeline
         glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -403,18 +389,15 @@ int main() {
         }
     }
 
-    // Clean up OpenCL resources
     clReleaseMemObject(clCurrentGrid);
     clReleaseMemObject(clNextGrid);
-    clReleaseMemObject(clRgbaBuffer);
+    clReleaseMemObject(clRgbaBufferPBO);
     clReleaseKernel(computeKernel);
     clReleaseKernel(renderKernel);
     clReleaseProgram(computeProgram);
     clReleaseProgram(renderProgram);
     clReleaseCommandQueue(commandQueue);
     clReleaseContext(context);
-
-    // Clean up GL resources
     glDeleteBuffers(1, &pbo);
     glDeleteTextures(1, &tex);
     glfwDestroyWindow(win);
