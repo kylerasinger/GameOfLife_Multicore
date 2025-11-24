@@ -49,13 +49,13 @@ struct World {
 };
 
 // OpenCL GPU kernel - computes next game state
-const char* cl_gpu_kernel_src = R"CLC(
+const char* clGpuKernelSourceString = R"CLC(
 inline uint lcg_rand_uint(uint state) {
     state = (1103515245u * state + 12345u);
     return state;
 }
 
-__kernel void gol_compute_kernel(
+__kernel void gol_logic_compute_kernel(
     const int width,
     const int height,
     const int num_species,
@@ -122,7 +122,7 @@ __kernel void gol_compute_kernel(
 )CLC";
 
 // OpenCL render kernel - renders grid to RGBA
-const char* cl_render_kernel_src = R"CLC(
+const char* clCpuKernelSourceString = R"CLC(
 __kernel void gol_render_kernel(
     const int width,
     const int height,
@@ -159,7 +159,7 @@ static void checkClHelper(cl_int err, const char* msg) {
 }
 
 int main() {
-    // Initialize World struct
+    std::cout << "Random species count: " << SPECIES_COUNT << "\n\n";
     World world;
     world.w = W;
     world.h = H;
@@ -170,18 +170,15 @@ int main() {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE); // This allows us to use old OpenGL calls.
     GLFWwindow* win = glfwCreateWindow(W, H, "OpenCL CPU and GPU Game of Life", nullptr, nullptr);
-    if (!win) return 1;
+    if (!win) return 2;
     glfwMakeContextCurrent(win);
 
     glfwSwapInterval(0);
-    if (glewInit() != GLEW_OK) {
-        std::cerr << "GLEW init failed\n";
-        return -1;
-    }
+    if (glewInit() != GLEW_OK) return 3;
 
-    // Set up projection matrix for orthographic rendering
+    // Set up for orthographic rendering (2D Rendering)
     glMatrixMode(GL_PROJECTION);
     glOrtho(0, W, H, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
@@ -205,105 +202,87 @@ int main() {
         }
     }
 
-    // -------- OpenCL setup --------
+    // Set up OpenCL
     cl_int clerr;
     cl_platform_id platform = nullptr;
     cl_uint num_plat = 0;
-    clerr = clGetPlatformIDs(1, &platform, &num_plat);
-    checkClHelper(clerr, "clGetPlatformIDs");
+    checkClHelper(clGetPlatformIDs(1, &platform, &num_plat), "clGetPlatformIDs");
 
     // Get GPU device
-    cl_device_id gpu_device = nullptr;
+    cl_device_id gpuDevice = nullptr;
     cl_uint num_gpu = 0;
-    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &gpu_device, &num_gpu);
+    clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &gpuDevice, &num_gpu);
     if (clerr != CL_SUCCESS) {
-        clerr = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &gpu_device, &num_gpu);
-        checkClHelper(clerr, "clGetDeviceIDs fallback");
+        checkClHelper(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &gpuDevice, &num_gpu),
+                      "clGetDeviceIDs fallback");
     }
 
     // Output device info
     if (OUTPUT_DEVICE_INFO) {
         char name[256];
-        std::cout << "\n=== GPU Device (Compute) ===\n";
-        clGetDeviceInfo(gpu_device, CL_DEVICE_NAME, sizeof(name), name, NULL);
+        std::cout << "--===+ GPU Device (Compute) +===--\n";
+        clGetDeviceInfo(gpuDevice, CL_DEVICE_NAME, sizeof(name), name, NULL);
         std::cout << "Device Name: " << name << "\n";
         cl_uint vendorId;
-        clGetDeviceInfo(gpu_device, CL_DEVICE_VENDOR_ID, sizeof(vendorId), &vendorId, NULL);
+        clGetDeviceInfo(gpuDevice, CL_DEVICE_VENDOR_ID, sizeof(vendorId), &vendorId, NULL);
         std::cout << "Vendor ID: " << vendorId << "\n";
         char vendor[256];
-        clGetDeviceInfo(gpu_device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+        clGetDeviceInfo(gpuDevice, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
         std::cout << "Vendor: " << vendor << "\n";
-        std::cout << "\nPipeline: GPU computes, OpenGL displays without shaders\n\n";
+        std::cout << "Info is from openCl clGetDeviceInfo()\n\n";
     }
 
-    // Create context with GL interop
-    cl_context_properties props[] = {
-        CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
+    // Create context with GL interop, this is what allows OpenCl to call OpenGl. Taken from slides
+    cl_context_properties properties[] = {
         CL_GL_CONTEXT_KHR, (cl_context_properties)wglGetCurrentContext(),
         CL_WGL_HDC_KHR,     (cl_context_properties)wglGetCurrentDC(),
+        CL_CONTEXT_PLATFORM, (cl_context_properties)platform,
         0
     };
 
-    cl_context context = clCreateContext(props, 1, &gpu_device, NULL, NULL, &clerr);
+    cl_context context = clCreateContext(properties, 1, &gpuDevice, NULL, NULL, &clerr);
     checkClHelper(clerr, "clCreateContext");
 
-    cl_command_queue queue = clCreateCommandQueue(context, gpu_device, 0, &clerr);
+    cl_command_queue queue = clCreateCommandQueue(context, gpuDevice, 0, &clerr);
     checkClHelper(clerr, "clCreateCommandQueue");
 
     // Build compute program
-    const char* gpu_src_ptr = cl_gpu_kernel_src;
-    cl_program compute_program = clCreateProgramWithSource(context, 1, &gpu_src_ptr, nullptr, &clerr);
-    checkClHelper(clerr, "clCreateProgramWithSource compute");
-    clerr = clBuildProgram(compute_program, 1, &gpu_device, NULL, NULL, NULL);
-    if (clerr != CL_SUCCESS) {
-        size_t logsz = 0;
-        clGetProgramBuildInfo(compute_program, gpu_device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
-        std::vector<char> log(logsz + 1);
-        clGetProgramBuildInfo(compute_program, gpu_device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
-        std::cerr << "Compute Build log:\n" << log.data() << "\n";
-        checkClHelper(clerr, "clBuildProgram compute");
-    }
+    const char* gpuKernelSource = clGpuKernelSourceString;
+    cl_program gpuProgram = clCreateProgramWithSource(context, 1, &gpuKernelSource, nullptr, &clerr);
+    checkClHelper(clerr, "clCreateProgramWithSource");
+    checkClHelper(clBuildProgram(gpuProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
 
-    cl_kernel compute_kernel = clCreateKernel(compute_program, "gol_compute_kernel", &clerr);
-    checkClHelper(clerr, "clCreateKernel compute");
+    cl_kernel gpuKernel = clCreateKernel(gpuProgram, "gol_logic_compute_kernel", &clerr);
+    checkClHelper(clerr, "clCreateKernel");
 
     // Build render program
-    const char* render_src_ptr = cl_render_kernel_src;
-    cl_program render_program = clCreateProgramWithSource(context, 1, &render_src_ptr, nullptr, &clerr);
-    checkClHelper(clerr, "clCreateProgramWithSource render");
-    clerr = clBuildProgram(render_program, 1, &gpu_device, NULL, NULL, NULL);
-    if (clerr != CL_SUCCESS) {
-        size_t logsz = 0;
-        clGetProgramBuildInfo(render_program, gpu_device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsz);
-        std::vector<char> log(logsz + 1);
-        clGetProgramBuildInfo(render_program, gpu_device, CL_PROGRAM_BUILD_LOG, logsz, log.data(), NULL);
-        std::cerr << "Render Build log:\n" << log.data() << "\n";
-        checkClHelper(clerr, "clBuildProgram render");
-    }
+    const char* cpuKernelSource = clCpuKernelSourceString;
+    cl_program cpuProgram = clCreateProgramWithSource(context, 1, &cpuKernelSource, nullptr, &clerr);
+    checkClHelper(clerr, "clCreateProgramWithSource");
+    checkClHelper(clBuildProgram(cpuProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
 
-    cl_kernel render_kernel = clCreateKernel(render_program, "gol_render_kernel", &clerr);
-    checkClHelper(clerr, "clCreateKernel render");
+    cl_kernel cpuKernel = clCreateKernel(cpuProgram, "gol_render_kernel", &clerr);
+    checkClHelper(clerr, "clCreateKernel");
 
-    // Create OpenCL buffers for grid
-    cl_mem grid_in = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint8_t) * world.currentGrid.size(), nullptr, &clerr);
-    checkClHelper(clerr, "clCreateBuffer grid_in");
+    // Create OpenCL mem for grid
+    cl_mem clCurrentGrid = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint8_t) * world.currentGrid.size(), nullptr, &clerr);
+    checkClHelper(clerr, "clCreateBuffer");
+    cl_mem clNextGrid = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * world.nextGrid.size(), nullptr, &clerr);
+    checkClHelper(clerr, "clCreateBuffer");
 
-    cl_mem grid_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * world.nextGrid.size(), nullptr, &clerr);
-    checkClHelper(clerr, "clCreateBuffer grid_out");
-
-    // Create OpenCL buffer for RGBA pixel data
-    std::vector<uint8_t> pixel_data(world.w * world.h * 4);
-    cl_mem rgba_buffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * pixel_data.size(), nullptr, &clerr);
+    // Create OpenCL mem for RGBA pixel data
+    std::vector<uint8_t> pixelData(world.w * world.h * 4);
+    cl_mem clRgbaBuffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * pixelData.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer rgba_buffer");
 
-    // Set kernel constant args for compute
-    checkClHelper(clSetKernelArg(compute_kernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
-    checkClHelper(clSetKernelArg(compute_kernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
-    checkClHelper(clSetKernelArg(compute_kernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
+    // Set kernel constant args for GPU compute
+    checkClHelper(clSetKernelArg(gpuKernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
+    checkClHelper(clSetKernelArg(gpuKernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
+    checkClHelper(clSetKernelArg(gpuKernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
 
-    // Set kernel constant args for render
-    checkClHelper(clSetKernelArg(render_kernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
-    checkClHelper(clSetKernelArg(render_kernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
+    // Set kernel constant args for CPU render
+    checkClHelper(clSetKernelArg(cpuKernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
+    checkClHelper(clSetKernelArg(cpuKernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
 
     auto nextTick = std::chrono::steady_clock::now();
     auto lastTime = nextTick;
@@ -323,44 +302,44 @@ int main() {
         ++frame;
 
         // Upload current grid to GPU
-        checkClHelper(clEnqueueWriteBuffer(queue, grid_in, CL_FALSE, 0,
+        checkClHelper(clEnqueueWriteBuffer(queue, clCurrentGrid, CL_FALSE, 0,
             sizeof(uint8_t) * world.currentGrid.size(), world.currentGrid.data(), 0, NULL, NULL),
             "clEnqueueWriteBuffer grid_in");
 
         // GPU: Compute next state
         uint32_t frame_seed = frame * 1640531527u + 123456789u;
-        checkClHelper(clSetKernelArg(compute_kernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg compute 3");
-        checkClHelper(clSetKernelArg(compute_kernel, 4, sizeof(cl_mem), &grid_in), "clSetKernelArg compute 4");
-        checkClHelper(clSetKernelArg(compute_kernel, 5, sizeof(cl_mem), &grid_out), "clSetKernelArg compute 5");
+        checkClHelper(clSetKernelArg(gpuKernel, 3, sizeof(uint32_t), &frame_seed), "clSetKernelArg compute 3");
+        checkClHelper(clSetKernelArg(gpuKernel, 4, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg compute 4");
+        checkClHelper(clSetKernelArg(gpuKernel, 5, sizeof(cl_mem), &clNextGrid), "clSetKernelArg compute 5");
 
         size_t gws[2] = { (size_t)world.w, (size_t)world.h };
         size_t lws[2] = { 16, 16 };
-        checkClHelper(clEnqueueNDRangeKernel(queue, compute_kernel, 2, NULL, gws, lws, 0, NULL, NULL),
+        checkClHelper(clEnqueueNDRangeKernel(queue, gpuKernel, 2, NULL, gws, lws, 0, NULL, NULL),
             "clEnqueueNDRangeKernel compute");
 
         // GPU: Render current grid to RGBA buffer
-        checkClHelper(clSetKernelArg(render_kernel, 2, sizeof(cl_mem), &grid_in), "clSetKernelArg render 2");
-        checkClHelper(clSetKernelArg(render_kernel, 3, sizeof(cl_mem), &rgba_buffer), "clSetKernelArg render 3");
+        checkClHelper(clSetKernelArg(cpuKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
+        checkClHelper(clSetKernelArg(cpuKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
 
-        checkClHelper(clEnqueueNDRangeKernel(queue, render_kernel, 2, NULL, gws, lws, 0, NULL, NULL),
+        checkClHelper(clEnqueueNDRangeKernel(queue, cpuKernel, 2, NULL, gws, lws, 0, NULL, NULL),
             "clEnqueueNDRangeKernel render");
 
         // Wait for OpenCL to finish
         clFinish(queue);
 
         // Read back pixel data from GPU
-        checkClHelper(clEnqueueReadBuffer(queue, rgba_buffer, CL_TRUE, 0,
-            sizeof(uint8_t) * pixel_data.size(), pixel_data.data(), 0, NULL, NULL),
+        checkClHelper(clEnqueueReadBuffer(queue, clRgbaBuffer, CL_TRUE, 0,
+            sizeof(uint8_t) * pixelData.size(), pixelData.data(), 0, NULL, NULL),
             "clEnqueueReadBuffer rgba_buffer");
 
         // Read back next grid state
-        checkClHelper(clEnqueueReadBuffer(queue, grid_out, CL_TRUE, 0,
+        checkClHelper(clEnqueueReadBuffer(queue, clNextGrid, CL_TRUE, 0,
             sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(), 0, NULL, NULL),
             "clEnqueueReadBuffer grid_out");
 
         // Update texture with pixel data
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, world.w, world.h, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data.data());
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, world.w, world.h, GL_RGBA, GL_UNSIGNED_BYTE, pixelData.data());
 
         // Swap grid buffers
         world.currentGrid.swap(world.nextGrid);
@@ -395,13 +374,13 @@ int main() {
     }
 
     // Clean up OpenCL resources
-    clReleaseMemObject(grid_in);
-    clReleaseMemObject(grid_out);
-    clReleaseMemObject(rgba_buffer);
-    clReleaseKernel(compute_kernel);
-    clReleaseKernel(render_kernel);
-    clReleaseProgram(compute_program);
-    clReleaseProgram(render_program);
+    clReleaseMemObject(clCurrentGrid);
+    clReleaseMemObject(clNextGrid);
+    clReleaseMemObject(clRgbaBuffer);
+    clReleaseKernel(gpuKernel);
+    clReleaseKernel(cpuKernel);
+    clReleaseProgram(gpuProgram);
+    clReleaseProgram(cpuProgram);
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
 
