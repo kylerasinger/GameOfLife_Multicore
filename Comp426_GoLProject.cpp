@@ -11,6 +11,7 @@
 #include <iostream>
 #include <random>
 #include <vector>
+#include <cstring>
 
 // Window / grid size
 static constexpr int W = 1024;
@@ -193,6 +194,13 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
+    // Create OpenGL Pixel Buffer Object (PBO) for shared memory
+    GLuint pbo;
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, W * H * 4 * sizeof(uint8_t), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
     // Initialize grid randomly
     std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
     std::uniform_int_distribution<int> d(0, world.species);
@@ -215,6 +223,18 @@ int main() {
     if (clerr != CL_SUCCESS) {
         checkClHelper(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &gpuDevice, &num_gpu),
                       "clGetDeviceIDs fallback");
+    }
+
+    // Check for cl_khr_gl_sharing extension support
+    size_t extensionsSize;
+    clGetDeviceInfo(gpuDevice, CL_DEVICE_EXTENSIONS, 0, nullptr, &extensionsSize);
+    std::vector<char> extensions(extensionsSize);
+    clGetDeviceInfo(gpuDevice, CL_DEVICE_EXTENSIONS, extensionsSize, extensions.data(), nullptr);
+    std::string extensionsStr(extensions.data());
+
+    if (extensionsStr.find("cl_khr_gl_sharing") == std::string::npos) {
+        std::cerr << "Error: cl_khr_gl_sharing extension not supported!\n";
+        return 4;
     }
 
     // Output device info
@@ -270,10 +290,9 @@ int main() {
     cl_mem clNextGrid = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * world.nextGrid.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer");
 
-    // Create OpenCL mem for RGBA pixel data
-    std::vector<uint8_t> pixelData(world.w * world.h * 4);
-    cl_mem clRgbaBuffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * pixelData.size(), nullptr, &clerr);
-    checkClHelper(clerr, "clCreateBuffer rgba_buffer");
+    // Create OpenCL buffer from OpenGL PBO (shared memory!)
+    cl_mem clRgbaBuffer = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pbo, &clerr);
+    checkClHelper(clerr, "clCreateFromGLBuffer");
 
     // Set kernel constant args for GPU compute
     checkClHelper(clSetKernelArg(gpuKernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
@@ -320,32 +339,39 @@ int main() {
                                              groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
 
-        // GPU: Render current grid to RGBA buffer
+        // Flush OpenGL queue before acquiring shared objects
+        glFlush();
+
+        // Acquire shared GL object for OpenCL use
+        checkClHelper(clEnqueueAcquireGLObjects(gpuCommandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+                      "clEnqueueAcquireGLObjects");
+
+        // GPU: Render current grid to shared RGBA buffer
         checkClHelper(clSetKernelArg(cpuKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
         checkClHelper(clSetKernelArg(cpuKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
 
-        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, cpuKernel, 2, NULL, 
+        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, cpuKernel, 2, NULL,
                                              threadCount, groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
+
+        // Release shared GL object back to OpenGL
+        checkClHelper(clEnqueueReleaseGLObjects(gpuCommandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+                      "clEnqueueReleaseGLObjects");
 
         // Wait for OpenCL to finish
         clFinish(gpuCommandQueue);
 
-        // Read back pixel data from GPU
-        checkClHelper(clEnqueueReadBuffer(gpuCommandQueue, clRgbaBuffer, CL_TRUE, 0,
-                                          sizeof(uint8_t) * pixelData.size(), pixelData.data(), 
-                                          0, NULL, NULL),
-                      "clEnqueueReadBuffer rgba_buffer");
-
         // Read back next grid state
         checkClHelper(clEnqueueReadBuffer(gpuCommandQueue, clNextGrid, CL_TRUE, 0,
-                                          sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(), 
+                                          sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(),
                                           0, NULL, NULL),
                       "clEnqueueReadBuffer grid_out");
 
-        // Update texture with pixel data
+        // Update texture from PBO
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, world.w, world.h, GL_RGBA, GL_UNSIGNED_BYTE, pixelData.data());
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, world.w, world.h, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
         // Swap grid buffers
         world.currentGrid.swap(world.nextGrid);
@@ -391,6 +417,7 @@ int main() {
     clReleaseContext(context);
 
     // Clean up GL resources
+    glDeleteBuffers(1, &pbo);
     glDeleteTextures(1, &tex);
     glfwDestroyWindow(win);
     glfwTerminate();
