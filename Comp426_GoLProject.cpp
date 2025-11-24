@@ -48,10 +48,6 @@ struct World {
     int w, h, species;
 };
 
-// CPU-side buffers
-std::vector<uint8_t> currentGridBuffer(W * H);
-std::vector<uint8_t> nextGrid(W* H);
-
 // OpenCL GPU kernel - computes next game state
 const char* cl_gpu_kernel_src = R"CLC(
 inline uint lcg_rand_uint(uint state) {
@@ -163,14 +159,22 @@ static void checkClHelper(cl_int err, const char* msg) {
 }
 
 int main() {
+    // Initialize World struct
+    World world;
+    world.w = W;
+    world.h = H;
+    world.species = SPECIES_COUNT;
+    world.currentGrid.resize(W * H);
+    world.nextGrid.resize(W * H);
+
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE); // This allows us to use old opengl calls
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
     GLFWwindow* win = glfwCreateWindow(W, H, "OpenCL CPU and GPU Game of Life", nullptr, nullptr);
     if (!win) return 1;
     glfwMakeContextCurrent(win);
-    
+
     glfwSwapInterval(0);
     if (glewInit() != GLEW_OK) {
         std::cerr << "GLEW init failed\n";
@@ -194,10 +198,10 @@ int main() {
 
     // Initialize grid randomly
     std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
-    std::uniform_int_distribution<int> d(0, SPECIES_COUNT);
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            currentGridBuffer[idx(x, y)] = (uint8_t)d(rng);
+    std::uniform_int_distribution<int> d(0, world.species);
+    for (int y = 0; y < world.h; ++y) {
+        for (int x = 0; x < world.w; ++x) {
+            world.currentGrid[idx(x, y)] = (uint8_t)d(rng);
         }
     }
 
@@ -281,25 +285,25 @@ int main() {
     checkClHelper(clerr, "clCreateKernel render");
 
     // Create OpenCL buffers for grid
-    cl_mem grid_in = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint8_t) * currentGridBuffer.size(), nullptr, &clerr);
+    cl_mem grid_in = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint8_t) * world.currentGrid.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer grid_in");
 
-    cl_mem grid_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * currentGridBuffer.size(), nullptr, &clerr);
+    cl_mem grid_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * world.nextGrid.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer grid_out");
 
     // Create OpenCL buffer for RGBA pixel data
-    std::vector<uint8_t> pixel_data(W * H * 4);
+    std::vector<uint8_t> pixel_data(world.w * world.h * 4);
     cl_mem rgba_buffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(uint8_t) * pixel_data.size(), nullptr, &clerr);
     checkClHelper(clerr, "clCreateBuffer rgba_buffer");
 
     // Set kernel constant args for compute
-    checkClHelper(clSetKernelArg(compute_kernel, 0, sizeof(int), &W), "clSetKernelArg compute 0");
-    checkClHelper(clSetKernelArg(compute_kernel, 1, sizeof(int), &H), "clSetKernelArg compute 1");
-    checkClHelper(clSetKernelArg(compute_kernel, 2, sizeof(int), &SPECIES_COUNT), "clSetKernelArg compute 2");
+    checkClHelper(clSetKernelArg(compute_kernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
+    checkClHelper(clSetKernelArg(compute_kernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
+    checkClHelper(clSetKernelArg(compute_kernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
 
     // Set kernel constant args for render
-    checkClHelper(clSetKernelArg(render_kernel, 0, sizeof(int), &W), "clSetKernelArg render 0");
-    checkClHelper(clSetKernelArg(render_kernel, 1, sizeof(int), &H), "clSetKernelArg render 1");
+    checkClHelper(clSetKernelArg(render_kernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
+    checkClHelper(clSetKernelArg(render_kernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
 
     auto nextTick = std::chrono::steady_clock::now();
     auto lastTime = nextTick;
@@ -320,7 +324,7 @@ int main() {
 
         // Upload current grid to GPU
         checkClHelper(clEnqueueWriteBuffer(queue, grid_in, CL_FALSE, 0,
-            sizeof(uint8_t) * currentGridBuffer.size(), currentGridBuffer.data(), 0, NULL, NULL),
+            sizeof(uint8_t) * world.currentGrid.size(), world.currentGrid.data(), 0, NULL, NULL),
             "clEnqueueWriteBuffer grid_in");
 
         // GPU: Compute next state
@@ -329,7 +333,7 @@ int main() {
         checkClHelper(clSetKernelArg(compute_kernel, 4, sizeof(cl_mem), &grid_in), "clSetKernelArg compute 4");
         checkClHelper(clSetKernelArg(compute_kernel, 5, sizeof(cl_mem), &grid_out), "clSetKernelArg compute 5");
 
-        size_t gws[2] = { (size_t)W, (size_t)H };
+        size_t gws[2] = { (size_t)world.w, (size_t)world.h };
         size_t lws[2] = { 16, 16 };
         checkClHelper(clEnqueueNDRangeKernel(queue, compute_kernel, 2, NULL, gws, lws, 0, NULL, NULL),
             "clEnqueueNDRangeKernel compute");
@@ -350,17 +354,16 @@ int main() {
             "clEnqueueReadBuffer rgba_buffer");
 
         // Read back next grid state
-        
         checkClHelper(clEnqueueReadBuffer(queue, grid_out, CL_TRUE, 0,
-            sizeof(uint8_t) * nextGrid.size(), nextGrid.data(), 0, NULL, NULL),
+            sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(), 0, NULL, NULL),
             "clEnqueueReadBuffer grid_out");
 
         // Update texture with pixel data
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data.data());
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, world.w, world.h, GL_RGBA, GL_UNSIGNED_BYTE, pixel_data.data());
 
         // Swap grid buffers
-        currentGridBuffer.swap(nextGrid);
+        world.currentGrid.swap(world.nextGrid);
 
         // Render with fixed-function pipeline
         glClear(GL_COLOR_BUFFER_BIT);
@@ -369,9 +372,9 @@ int main() {
 
         glBegin(GL_QUADS);
         glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, 0.0f);
-        glTexCoord2f(1.0f, 0.0f); glVertex2f((float)W, 0.0f);
-        glTexCoord2f(1.0f, 1.0f); glVertex2f((float)W, (float)H);
-        glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, (float)H);
+        glTexCoord2f(1.0f, 0.0f); glVertex2f((float)world.w, 0.0f);
+        glTexCoord2f(1.0f, 1.0f); glVertex2f((float)world.w, (float)world.h);
+        glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, (float)world.h);
         glEnd();
         glDisable(GL_TEXTURE_2D);
 
