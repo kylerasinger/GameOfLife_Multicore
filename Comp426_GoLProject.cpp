@@ -1,7 +1,6 @@
 ﻿#include <windows.h>
 #include <glew.h>
 #include <GLFW/glfw3.h>
-
 #include <CL/cl.h>
 #include <CL/cl_gl.h>
 #include <gl/GL.h>
@@ -13,10 +12,9 @@
 #include <vector>
 #include <cstring>
 
-// Window / grid size
 static constexpr int W = 1024;
 static constexpr int H = 768;
-static constexpr int TARGET_FPS = 500;
+static constexpr int TARGET_FPS = 10;
 static constexpr bool TRACK_FPS = true;
 static constexpr bool OUTPUT_DEVICE_INFO = true;
 
@@ -41,7 +39,7 @@ static const std::vector<uint32_t> COLORS = {
 
 static constexpr auto TICK_INTERVAL = std::chrono::duration<double>(1.0 / TARGET_FPS);
 
-int idx(int x, int y) { return y * W + x; }
+int index(int x, int y) { return y * W + x; }
 
 struct World {
     std::vector<uint8_t> currentGrid;
@@ -50,7 +48,7 @@ struct World {
 };
 
 // OpenCL GPU kernel - computes next game state
-const char* clGpuKernelSourceString = R"CLC(
+const char* clComputeKernelSourceString = R"CLC(
 inline uint lcg_rand_uint(uint state) {
     state = (1103515245u * state + 12345u);
     return state;
@@ -123,7 +121,7 @@ __kernel void gol_logic_compute_kernel(
 )CLC";
 
 // OpenCL render kernel - renders grid to RGBA
-const char* clCpuKernelSourceString = R"CLC(
+const char* clRenderKernelSourceString = R"CLC(
 __kernel void gol_render_kernel(
     const int width,
     const int height,
@@ -206,7 +204,7 @@ int main() {
     std::uniform_int_distribution<int> d(0, world.species);
     for (int y = 0; y < world.h; ++y) {
         for (int x = 0; x < world.w; ++x) {
-            world.currentGrid[idx(x, y)] = (uint8_t)d(rng);
+            world.currentGrid[index(x, y)] = (uint8_t)d(rng);
         }
     }
 
@@ -263,25 +261,25 @@ int main() {
     cl_context context = clCreateContext(properties, 1, &gpuDevice, NULL, NULL, &clerr);
     checkClHelper(clerr, "clCreateContext");
 
-    cl_command_queue gpuCommandQueue = clCreateCommandQueue(context, gpuDevice, 0, &clerr);
+    cl_command_queue commandQueue = clCreateCommandQueue(context, gpuDevice, 0, &clerr);
     checkClHelper(clerr, "clCreateCommandQueue");
 
     // Build compute program
-    const char* gpuKernelSource = clGpuKernelSourceString;
-    cl_program gpuProgram = clCreateProgramWithSource(context, 1, &gpuKernelSource, nullptr, &clerr);
+    const char* computeKernelSource = clComputeKernelSourceString;
+    cl_program computeProgram = clCreateProgramWithSource(context, 1, &computeKernelSource, nullptr, &clerr);
     checkClHelper(clerr, "clCreateProgramWithSource");
-    checkClHelper(clBuildProgram(gpuProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
+    checkClHelper(clBuildProgram(computeProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
 
-    cl_kernel gpuKernel = clCreateKernel(gpuProgram, "gol_logic_compute_kernel", &clerr);
+    cl_kernel computeKernel = clCreateKernel(computeProgram, "gol_logic_compute_kernel", &clerr);
     checkClHelper(clerr, "clCreateKernel");
 
     // Build render program
-    const char* cpuKernelSource = clCpuKernelSourceString;
-    cl_program cpuProgram = clCreateProgramWithSource(context, 1, &cpuKernelSource, nullptr, &clerr);
+    const char* renderKernelSource = clRenderKernelSourceString;
+    cl_program renderProgram = clCreateProgramWithSource(context, 1, &renderKernelSource, nullptr, &clerr);
     checkClHelper(clerr, "clCreateProgramWithSource");
-    checkClHelper(clBuildProgram(cpuProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
+    checkClHelper(clBuildProgram(renderProgram, 1, &gpuDevice, NULL, NULL, NULL), "clBuildProgram");
 
-    cl_kernel cpuKernel = clCreateKernel(cpuProgram, "gol_render_kernel", &clerr);
+    cl_kernel renderKernel = clCreateKernel(renderProgram, "gol_render_kernel", &clerr);
     checkClHelper(clerr, "clCreateKernel");
 
     // Create OpenCL mem for grid
@@ -295,13 +293,13 @@ int main() {
     checkClHelper(clerr, "clCreateFromGLBuffer");
 
     // Set kernel constant args for GPU compute
-    checkClHelper(clSetKernelArg(gpuKernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
-    checkClHelper(clSetKernelArg(gpuKernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
-    checkClHelper(clSetKernelArg(gpuKernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
+    checkClHelper(clSetKernelArg(computeKernel, 0, sizeof(int), &world.w), "clSetKernelArg compute 0");
+    checkClHelper(clSetKernelArg(computeKernel, 1, sizeof(int), &world.h), "clSetKernelArg compute 1");
+    checkClHelper(clSetKernelArg(computeKernel, 2, sizeof(int), &world.species), "clSetKernelArg compute 2");
 
     // Set kernel constant args for CPU render
-    checkClHelper(clSetKernelArg(cpuKernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
-    checkClHelper(clSetKernelArg(cpuKernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
+    checkClHelper(clSetKernelArg(renderKernel, 0, sizeof(int), &world.w), "clSetKernelArg render 0");
+    checkClHelper(clSetKernelArg(renderKernel, 1, sizeof(int), &world.h), "clSetKernelArg render 1");
 
     auto nextTick = std::chrono::steady_clock::now();
     auto lastTime = nextTick;
@@ -321,21 +319,21 @@ int main() {
         ++frame;
 
         // Upload current grid to GPU
-        checkClHelper(clEnqueueWriteBuffer(gpuCommandQueue, clCurrentGrid, CL_FALSE, 0,
+        checkClHelper(clEnqueueWriteBuffer(commandQueue, clCurrentGrid, CL_FALSE, 0,
                                            sizeof(uint8_t) * world.currentGrid.size(), 
                                            world.currentGrid.data(), 0, NULL, NULL),
                       "clEnqueueWriteBuffer");
 
         // GPU: Compute next state
         uint32_t frameSeed = frame * SPECIES_COUNT; // This makes it random based on the frame count and species count
-        checkClHelper(clSetKernelArg(gpuKernel, 3, sizeof(uint32_t), &frameSeed), "clSetKernelArg compute 3");
-        checkClHelper(clSetKernelArg(gpuKernel, 4, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg compute 4");
-        checkClHelper(clSetKernelArg(gpuKernel, 5, sizeof(cl_mem), &clNextGrid), "clSetKernelArg compute 5");
+        checkClHelper(clSetKernelArg(computeKernel, 3, sizeof(uint32_t), &frameSeed), "clSetKernelArg compute 3");
+        checkClHelper(clSetKernelArg(computeKernel, 4, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg compute 4");
+        checkClHelper(clSetKernelArg(computeKernel, 5, sizeof(cl_mem), &clNextGrid), "clSetKernelArg compute 5");
 
         // Same thread count and work-groups as the CUDA implementation. 
         size_t threadCount[2] = { (size_t)world.w, (size_t)world.h };
         size_t groupSize[2] = { 16, 16 };
-        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, gpuKernel, 2, NULL, threadCount, 
+        checkClHelper(clEnqueueNDRangeKernel(commandQueue, computeKernel, 2, NULL, threadCount, 
                                              groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
 
@@ -343,26 +341,26 @@ int main() {
         glFlush();
 
         // Acquire shared GL object for OpenCL use
-        checkClHelper(clEnqueueAcquireGLObjects(gpuCommandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+        checkClHelper(clEnqueueAcquireGLObjects(commandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
                       "clEnqueueAcquireGLObjects");
 
         // GPU: Render current grid to shared RGBA buffer
-        checkClHelper(clSetKernelArg(cpuKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
-        checkClHelper(clSetKernelArg(cpuKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
+        checkClHelper(clSetKernelArg(renderKernel, 2, sizeof(cl_mem), &clCurrentGrid), "clSetKernelArg render 2");
+        checkClHelper(clSetKernelArg(renderKernel, 3, sizeof(cl_mem), &clRgbaBuffer), "clSetKernelArg render 3");
 
-        checkClHelper(clEnqueueNDRangeKernel(gpuCommandQueue, cpuKernel, 2, NULL,
+        checkClHelper(clEnqueueNDRangeKernel(commandQueue, renderKernel, 2, NULL,
                                              threadCount, groupSize, 0, NULL, NULL),
                       "clEnqueueNDRangeKernel");
 
         // Release shared GL object back to OpenGL
-        checkClHelper(clEnqueueReleaseGLObjects(gpuCommandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
+        checkClHelper(clEnqueueReleaseGLObjects(commandQueue, 1, &clRgbaBuffer, 0, NULL, NULL),
                       "clEnqueueReleaseGLObjects");
 
         // Wait for OpenCL to finish
-        clFinish(gpuCommandQueue);
+        clFinish(commandQueue);
 
         // Read back next grid state
-        checkClHelper(clEnqueueReadBuffer(gpuCommandQueue, clNextGrid, CL_TRUE, 0,
+        checkClHelper(clEnqueueReadBuffer(commandQueue, clNextGrid, CL_TRUE, 0,
                                           sizeof(uint8_t) * world.nextGrid.size(), world.nextGrid.data(),
                                           0, NULL, NULL),
                       "clEnqueueReadBuffer grid_out");
@@ -409,11 +407,11 @@ int main() {
     clReleaseMemObject(clCurrentGrid);
     clReleaseMemObject(clNextGrid);
     clReleaseMemObject(clRgbaBuffer);
-    clReleaseKernel(gpuKernel);
-    clReleaseKernel(cpuKernel);
-    clReleaseProgram(gpuProgram);
-    clReleaseProgram(cpuProgram);
-    clReleaseCommandQueue(gpuCommandQueue);
+    clReleaseKernel(computeKernel);
+    clReleaseKernel(renderKernel);
+    clReleaseProgram(computeProgram);
+    clReleaseProgram(renderProgram);
+    clReleaseCommandQueue(commandQueue);
     clReleaseContext(context);
 
     // Clean up GL resources
